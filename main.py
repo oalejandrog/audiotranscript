@@ -8,7 +8,6 @@ import argparse
 import time
 
 OUTPUT_FOLDER = "output_transcription"
-MODEL = "base"  # Set the Whisper model variant. For better performance, you can choose a different model. (See: https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages)
 
 # Expanded list of hesitation markers, including common variations
 HESITATION_MARKERS = [
@@ -47,10 +46,9 @@ def record_audio(record_seconds):
 
     frames = []
 
-    num_chunks = int(RATE / CHUNK * record_seconds)
-
     try:
         if record_seconds:
+            num_chunks = int(RATE / CHUNK * record_seconds)
             for i in range(num_chunks):
                 seconds_left = record_seconds - int(i * CHUNK / RATE)
                 print(f"Recording... {seconds_left} seconds remaining", end="\r")
@@ -61,11 +59,11 @@ def record_audio(record_seconds):
                 data = stream.read(CHUNK)
                 frames.append(data)
     except KeyboardInterrupt:
-        pass
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+        print("\nRecording stopped.")
+    finally:
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
 
     with wave.open(AUDIO_FILE, 'wb') as wf:
         wf.setnchannels(CHANNELS)
@@ -75,8 +73,7 @@ def record_audio(record_seconds):
 
     return AUDIO_FILE
 
-def transcribe_audio(audio_path):
-    model = whisper.load_model(MODEL)
+def transcribe_audio(model, audio_path):
     result = model.transcribe(audio_path)
     return result['text']
 
@@ -110,7 +107,12 @@ def main():
     parser = argparse.ArgumentParser(description="Audio Recorder with Whisper Transcription")
     parser.add_argument("--prep-time", type=int, default=0, help="Preparation time before recording in seconds")
     parser.add_argument("--seconds", type=int, default=None, help="Duration to record audio in seconds")
+    parser.add_argument("--model", type=str, default="small", help="Whisper model to use (e.g., tiny, base, small, medium, large)")
     args = parser.parse_args()
+
+    print(f"Loading Whisper model: {args.model}...")
+    model = whisper.load_model(args.model)
+    print("Model loaded.")
 
     print(f"Prepare to speak...", end="\n")
     if args.prep_time > 0:
@@ -120,7 +122,7 @@ def main():
         print("Recording started!")
 
     audio_path = record_audio(args.seconds)
-    transcription = transcribe_audio(audio_path)
+    transcription = transcribe_audio(model, audio_path)
     detected_hesitations = detect_hesitations(transcription)
 
     print(f"Transcription Preview: {transcription[:100]}...")

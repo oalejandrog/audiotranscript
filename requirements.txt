@@ -1,5 +1,7 @@
-openai-whisper
+faster-whisper
 pyaudio
 pydub
 numpy
 soundfile
+webrtcvad
+torch

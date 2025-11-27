@@ -1,134 +1,285 @@
 import pyaudio
 import wave
-import whisper
+from faster_whisper import WhisperModel
 import datetime
 import re
 import os
+import sys
 import argparse
 import time
+import threading
+import queue
+import numpy as np
+import torch
+import webrtcvad
+import collections
+import logging
+from contextlib import contextmanager
+from benchmarking import Benchmark
 
+# --- Configuration ---
 OUTPUT_FOLDER = "output_transcription"
+RATE = 16000  # Sample rate
+CHUNK = 1024  # Size of each audio chunk
+CHANNELS = 1  # Mono audio
+FORMAT = pyaudio.paInt16
+# Time in seconds for the audio buffer used for transcription
+TRANSCRIPTION_BUFFER_SECONDS = 1  # We'll use a smaller buffer and VAD
+# Threshold for audio volume to be considered "not silence"
+SILENCE_THRESHOLD = 0.01
 
-# Expanded list of hesitation markers, including common variations
-HESITATION_MARKERS = [
-    "um", "uh", "ah", "er", "well", "like", "you know", "so", "actually", "basically", 
-    "I mean", "right", "okay", "just", "seriously", "mmm", "uhm", "hmm", "ahh", "eh", 
-    "aah", "uhh", "huh", "let me think", "I guess", "I suppose", "I'm not sure", "I'm thinking", 
-    "what I mean is", "it’s like", "you know what I mean", "I don’t know", "it’s kind of", 
-    "kind of", "sort of", "something like that", "to be honest", "well, you see", "you see", 
-    "I believe", "if you will", "literally", "honestly", "probably", "uhmm", "aahhh", "umm",
-    # Spanish hesitation markers used by Spanish speakers speaking English
-    "eh", "a ver", "bueno", "pues", "digamos", "como", "o sea", "ya sabes", "bueno, a ver", 
-    "sabes", "ehhh", "mmm", "aaaa", "eeee", "mmmm", "mmm", "hmm"
-]
+# Common phrases to hint the model (Cache/Optimization)
+COMMON_PHRASES = "Hello, how are you? Thank you. Please. Yes. No. Goodbye. I understand. Can you help me?"
 
-def record_audio(record_seconds):
-    print("Recording... Press Ctrl+C to stop.")
-    
-    RATE = 16000  # Sample rate
-    CHUNK = 1024  # Size of each audio chunk
-    FORMAT = pyaudio.paInt16  # Format for the audio input
-    CHANNELS = 1  # Mono audio
-    
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    AUDIO_FILE = os.path.join(OUTPUT_FOLDER, f"recorded_audio_{timestamp}.wav")
-   
-    # Ensure the output folder exists before recording
-    if not os.path.exists(OUTPUT_FOLDER):
-        os.makedirs(OUTPUT_FOLDER)
+# --- Globals ---
+audio_queue = queue.Queue()
+speech_queue = queue.Queue()
+recording_stop_event = threading.Event()
 
-    p = pyaudio.PyAudio()
-    stream = p.open(format=FORMAT,
-                    channels=CHANNELS,
-                    rate=RATE,
-                    input=True,
-                    frames_per_buffer=CHUNK)
+# Silence faster_whisper logs
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
-    frames = []
-
+@contextmanager
+def ignore_stderr():
+    """Context manager to suppress C-level stderr output (ALSA warnings)."""
     try:
-        if record_seconds:
-            num_chunks = int(RATE / CHUNK * record_seconds)
-            for i in range(num_chunks):
-                seconds_left = record_seconds - int(i * CHUNK / RATE)
-                print(f"Recording... {seconds_left} seconds remaining", end="\r")
-                data = stream.read(CHUNK)
-                frames.append(data)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        old_stderr = os.dup(2)
+        sys.stderr.flush()
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        try:
+            yield
+        finally:
+            os.dup2(old_stderr, 2)
+            os.close(old_stderr)
+    except Exception:
+        # If anything goes wrong with suppression, just yield
+        yield
+
+class VADAudio:
+    """A class to wrap PyAudio and WebRTC VAD."""
+    def __init__(self, aggressiveness=3, frame_duration_ms=30):
+        self.vad = webrtcvad.Vad(aggressiveness)
+        self.frame_duration_ms = frame_duration_ms
+        self.sample_rate = RATE
+        self.frame_size = int(self.sample_rate * (self.frame_duration_ms / 1000.0) * 2)
+        self.ring_buffer = collections.deque(maxlen=30) # buffer for context
+        self.triggered = False
+
+    def vad_collector(self, in_data):
+        """Generator that yields audio frames from a buffer."""
+        for frame in self.frames_from_buffer(in_data):
+            is_speech = self.vad.is_speech(frame, self.sample_rate)
+            
+            if not self.triggered:
+                self.ring_buffer.append((frame, is_speech))
+                num_voiced = len([f for f, speech in self.ring_buffer if speech])
+                if num_voiced > 0.9 * self.ring_buffer.maxlen:
+                    self.triggered = True
+                    yield b''.join([f for f, s in self.ring_buffer])
+                    self.ring_buffer.clear()
+            else:
+                yield frame
+                self.ring_buffer.append((frame, is_speech))
+                num_unvoiced = len([f for f, speech in self.ring_buffer if not speech])
+                if num_unvoiced > 0.9 * self.ring_buffer.maxlen:
+                    self.triggered = False
+                    yield None
+                    self.ring_buffer.clear()
+
+    def frames_from_buffer(self, in_data):
+        """Generator that yields audio frames from a buffer."""
+        offset = 0
+        while offset + self.frame_size <= len(in_data):
+            yield in_data[offset:offset + self.frame_size]
+            offset += self.frame_size
+
+
+def record_thread(chunk, rate, channels, format):
+    """
+    Captures audio from the microphone and puts it into a queue.
+    """
+    # Suppress ALSA errors during initialization
+    with ignore_stderr():
+        p = pyaudio.PyAudio()
+        
+    stream = p.open(format=format,
+                    channels=channels,
+                    rate=rate,
+                    input=True,
+                    frames_per_buffer=chunk)
+    
+    print("Recording started. Press Ctrl+C to stop.")
+    
+    while not recording_stop_event.is_set():
+        try:
+            data = stream.read(chunk, exception_on_overflow=False)
+            audio_queue.put(data)
+        except Exception as e:
+            print(f"Error reading from audio stream: {e}")
+            break
+            
+    print("Recording thread stopping.")
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
+def vad_thread(vad_aggressiveness):
+    """
+    Consumes raw audio from audio_queue, performs VAD, and pushes complete speech segments to speech_queue.
+    """
+    print("VAD processing started.")
+    vad_audio = VADAudio(aggressiveness=vad_aggressiveness)
+    frames = b''
+
+    while not recording_stop_event.is_set():
+        try:
+            audio_data = audio_queue.get(timeout=1)
+            
+            for chunk in vad_audio.vad_collector(audio_data):
+                if chunk is not None:
+                    frames += chunk
+                else: # End of speech detected
+                    if frames:
+                        # Push complete speech segment to inference queue
+                        speech_queue.put(frames)
+                        # print(f"[VAD] Speech segment detected ({len(frames)} bytes), queued for transcription.")
+                    frames = b'' # Reset buffer
+
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Error in VAD thread: {e}")
+            break
+    
+    print("VAD thread stopping.")
+
+def transcribe_thread(model_name, device, language, beam_size, compute_type_arg):
+    """
+    Transcribes audio segments from the speech_queue using the Whisper model.
+    """
+    print(f"Loading Faster-Whisper model: {model_name}...")
+    model = None
+
+    if device == "cuda":
+        if compute_type_arg != "auto":
+            # User forced a specific type
+            try:
+                print(f"Attempting to load on {device} with {compute_type_arg} precision (forced)...")
+                model = WhisperModel(model_name, device=device, compute_type=compute_type_arg)
+                print(f"Success: Model loaded on {device} with {compute_type_arg} precision.")
+            except Exception as e:
+                print(f"Failed to load on {device} with {compute_type_arg}: {e}")
         else:
-            while True:
-                data = stream.read(CHUNK)
-                frames.append(data)
-    except KeyboardInterrupt:
-        print("\nRecording stopped.")
-    finally:
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+            # Auto-detect: Try preferred compute types for CUDA
+            # GTX 10xx series often doesn't support native float16 efficient execution.
+            # We try a sequence of fallbacks.
+            compute_types_to_try = ["float16", "bfloat16", "int8_float16", "int8", "float32"]
+            
+            for ct in compute_types_to_try:
+                try:
+                    print(f"Attempting to load on {device} with {ct} precision...")
+                    model = WhisperModel(model_name, device=device, compute_type=ct)
+                    print(f"Success: Model loaded on {device} with {ct} precision.")
+                    break
+                except Exception as e:
+                    print(f"Failed to load on {device} with {ct}: {e}")
 
-    with wave.open(AUDIO_FILE, 'wb') as wf:
-        wf.setnchannels(CHANNELS)
-        wf.setsampwidth(p.get_sample_size(FORMAT))
-        wf.setframerate(RATE)
-        wf.writeframes(b''.join(frames))
+    # Final fallback to CPU if CUDA failed or wasn't requested
+    if model is None:
+        print("Falling back to CPU (int8)...")
+        try:
+            model = WhisperModel(model_name, device="cpu", compute_type="int8")
+            print("Success: Model loaded on CPU with int8 precision.")
+        except Exception as e:
+            print(f"CRITICAL Error: Could not load model on CPU. {e}")
+            return
 
-    return AUDIO_FILE
+    print(f"Transcriber ready (Language: {language}, Beam Size: {beam_size}).")
 
-def transcribe_audio(model, audio_path):
-    result = model.transcribe(audio_path)
-    return result['text']
+    while not recording_stop_event.is_set():
+        try:
+            # Wait for speech segments
+            frames = speech_queue.get(timeout=1)
+            
+            # Convert buffer to numpy array
+            audio_np = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # Transcribe with Benchmark
+            with Benchmark("Transcription Segment"):
+                # Streaming generator - iterating triggers inference
+                segments, info = model.transcribe(
+                    audio_np, 
+                    beam_size=beam_size,
+                    language=language,
+                    initial_prompt=COMMON_PHRASES
+                )
+                
+                # Process segments as they stream in
+                full_text = []
+                for segment in segments:
+                    full_text.append(segment.text)
+                
+                text = " ".join(full_text).strip()
 
-def detect_hesitations(transcription):
-    detected_hesitations = []
+            if text:
+                print(f"Transcription: {text}")
 
-    # Normalize the transcription to lowercase to improve matching
-    transcription = transcription.lower()
-
-    for marker in HESITATION_MARKERS:
-        if re.search(r'\b' + re.escape(marker) + r'\b', transcription):
-            detected_hesitations.append(marker)
-
-    return detected_hesitations
-
-def save_transcription(transcription, audio_file, detected_hesitations):
-    base_name = os.path.splitext(os.path.basename(audio_file))[0]
-    transcript_path = os.path.join(OUTPUT_FOLDER, f"{base_name}_transcript.txt")
-
-    with open(transcript_path, 'w') as file:
-        file.write("Transcription:\n")
-        file.write(transcription)
-
-        if detected_hesitations:
-            file.write("\n\nDetected Hesitations:\n")
-            file.write(", ".join(detected_hesitations))
-
-    print(f"Transcript saved at {transcript_path}")
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Error in transcription thread: {e}")
+            break
+    
+    print("Transcription thread stopping.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Audio Recorder with Whisper Transcription")
-    parser.add_argument("--prep-time", type=int, default=0, help="Preparation time before recording in seconds")
-    parser.add_argument("--seconds", type=int, default=None, help="Duration to record audio in seconds")
-    parser.add_argument("--model", type=str, default="small", help="Whisper model to use (e.g., tiny, base, small, medium, large)")
+    parser = argparse.ArgumentParser(description="Real-time Audio Recorder with Faster-Whisper Transcription and VAD")
+    parser.add_argument("--prep-time", type=int, default=3, help="Preparation time before recording starts in seconds.")
+    parser.add_argument("--model", type=str, default="small", help="Whisper model to use (e.g., tiny, base, small, medium, large).")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for computation ('cpu' or 'cuda').")
+    parser.add_argument("--vad-aggressiveness", type=int, default=3, choices=range(4), help="Set VAD aggressiveness from 0 to 3 (3 is most aggressive).")
+    parser.add_argument("--language", type=str, default="en", help="Language code for transcription (e.g., 'en'). Default is 'en'. Set to None to enable auto-detection (slower).")
+    parser.add_argument("--beam-size", type=int, default=1, help="Beam size for decoding. Default is 1 (greedy) for speed. Increase for accuracy.")
+    parser.add_argument("--compute-type", type=str, default="auto", help="Compute type for model (e.g., float16, int8, int8_float16, float32). Default 'auto' checks availability.")
     args = parser.parse_args()
+    
+    # Handle "None" string from CLI if user really wants auto-detection
+    lang = args.language if args.language.lower() != "none" else None
 
-    print(f"Loading Whisper model: {args.model}...")
-    model = whisper.load_model(args.model)
-    print("Model loaded.")
-
-    print(f"Prepare to speak...", end="\n")
     if args.prep_time > 0:
+        print(f"Prepare to speak...")
         for i in range(args.prep_time, 0, -1):
-            print(f"Recording will start in {i} seconds.", end="\r")
+            print(f"Recording will start in {i} seconds...   ", end="\r")
             time.sleep(1)
-        print("Recording started!")
+        print("Recording will start now!            ")
 
-    audio_path = record_audio(args.seconds)
-    transcription = transcribe_audio(model, audio_path)
-    detected_hesitations = detect_hesitations(transcription)
+    # Start the recording thread
+    recorder = threading.Thread(target=record_thread, args=(CHUNK, RATE, CHANNELS, FORMAT))
+    recorder.start()
 
-    print(f"Transcription Preview: {transcription[:100]}...")
+    # Start the VAD thread
+    vad_processor = threading.Thread(target=vad_thread, args=(args.vad_aggressiveness,))
+    vad_processor.start()
 
-    save_transcription(transcription, audio_path, detected_hesitations)
+    # Start the transcription thread
+    transcriber = threading.Thread(target=transcribe_thread, args=(args.model, args.device, lang, args.beam_size, args.compute_type))
+    transcriber.start()
+
+    try:
+        while recorder.is_alive() and transcriber.is_alive() and vad_processor.is_alive():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping application...")
+        recording_stop_event.set()
+
+    # Wait for threads to finish
+    recorder.join()
+    vad_processor.join()
+    transcriber.join()
+    print("Application stopped.")
+
 
 if __name__ == "__main__":
     main()
-
